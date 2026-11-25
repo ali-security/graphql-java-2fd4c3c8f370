@@ -6,10 +6,16 @@ on:
       version:
         description: 'the version to be released'
         required: true
+        default: '21.5'
+      test-filter:
+        description: 'Gradle test task + --tests selector; empty runs the full check'
+        required: false
+        default: ''
 
 jobs:
   buildAndPublish:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       MAVEN_CENTRAL_PGP_KEY: ${{ secrets.MAVEN_CENTRAL_PGP_KEY }}
       MAVEN_CENTRAL_USER: ${{ secrets.MAVEN_CENTRAL_USER }}
@@ -24,5 +30,113 @@ jobs:
         with:
           java-version: '11'
           distribution: 'corretto'
+          cache: gradle
       - name: build test and publish
-        run: ./gradlew assemble && ./gradlew check --info && ./gradlew publishToSonatype closeAndReleaseSonatypeStagingRepository -x check --info --stacktrace
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew assemble --no-build-cache && ./gradlew ${{ inputs.test-filter }} --no-build-cache --info && ./gradlew publishToMavenLocal -x signGraphqlJavaPublication -x check --no-build-cache --info --stacktrace
+          else
+            ./gradlew assemble --no-build-cache && ./gradlew check --no-build-cache --info && ./gradlew publishToMavenLocal -x signGraphqlJavaPublication -x check --no-build-cache --info --stacktrace
+          fi
+      - name: upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphql-java-jar
+          path: build/libs/graphql-java-${{ github.event.inputs.version }}.jar
+          if-no-files-found: error
+      - name: test summary and skip reasons
+        if: always()
+        shell: python3 {0}
+        run: |
+          import glob, os, re
+          import xml.etree.ElementTree as ET
+
+          src_files = glob.glob('src/test/**/*.groovy', recursive=True) + glob.glob('src/test/**/*.java', recursive=True)
+          src_cache = {}
+
+          def read(p):
+              if p not in src_cache:
+                  with open(p, encoding='utf-8', errors='replace') as f:
+                      src_cache[p] = f.read().splitlines()
+              return src_cache[p]
+
+          def ignore_reason(lines, idx):
+              # walk up from the test line looking for @Ignore and a comment above it
+              for j in range(idx - 1, max(idx - 9, -1), -1):
+                  line = lines[j].strip()
+                  m = re.match(r'@Ignore\s*\(\s*(?:value\s*=\s*)?["\'](.*)["\']\s*\)', line)
+                  if m:
+                      return m.group(1)
+                  if line.startswith('@Ignore'):
+                      for k in range(j - 1, max(j - 5, -1), -1):
+                          c = lines[k].strip()
+                          if c.startswith('//') or c.startswith('*') or c.startswith('/*'):
+                              return c.lstrip('/* ').strip() or '@Ignore (no message)'
+                          if c:
+                              break
+                      return '@Ignore annotation (no message)'
+              return None
+
+          def class_ignore(lines):
+              for i, l in enumerate(lines):
+                  if re.match(r'\s*(public\s+)?(abstract\s+)?class\s', l):
+                      for j in range(i - 1, max(i - 6, -1), -1):
+                          s = lines[j].strip()
+                          m = re.match(r'@Ignore\s*\(\s*["\'](.*)["\']\s*\)', s)
+                          if m:
+                              return 'class-level @Ignore: ' + m.group(1)
+                          if s.startswith('@Ignore'):
+                              return 'class-level @Ignore'
+                      return None
+              return None
+
+          def tck_reason(name):
+              if name.startswith('untested_'):
+                  return 'reactive-streams TCK: rule is not verifiable (untested_*), TCK marks it SKIPPED by design'
+              if name.startswith('optional_spec111'):
+                  return 'reactive-streams TCK: optional multi-subscribe rule 1.11 not supported by this publisher'
+              if name.startswith('required_spec317'):
+                  return 'reactive-streams TCK: publisher maxElementsFromPublisher (10000) < Long.MAX_VALUE/2147483647 demand'
+              return None
+
+          def find_reason(classname, name):
+              r = tck_reason(name)
+              if r:
+                  return r
+              simple = classname.split('.')[-1]
+              cands = [p for p in src_files if os.path.splitext(os.path.basename(p))[0] == simple]
+              for p in cands:
+                  lines = read(p)
+                  key = name.split('[')[0].strip()
+                  for i, l in enumerate(lines):
+                      if key and (('"' + key + '"') in l or ("'" + key + "'") in l or re.search(r'\b' + re.escape(key) + r'\s*\(', l)):
+                          r = ignore_reason(lines, i)
+                          if r:
+                              return r
+                  r = class_ignore(lines)
+                  if r:
+                      return r
+              return 'skipped by runner (no message in report)'
+
+          total = {'tests': 0, 'failures': 0, 'errors': 0, 'skipped': 0}
+          skipped = []
+          for task in ('test', 'testng'):
+              t = {'tests': 0, 'failures': 0, 'errors': 0, 'skipped': 0}
+              for f in glob.glob(f'build/test-results/{task}/*.xml'):
+                  root = ET.parse(f).getroot()
+                  suites = [root] if root.tag == 'testsuite' else root.findall('testsuite')
+                  for s in suites:
+                      for k in t:
+                          t[k] += int(s.get(k, 0) or 0)
+                      for tc in s.findall('testcase'):
+                          if tc.find('skipped') is not None:
+                              skipped.append((task, tc.get('classname', ''), tc.get('name', '')))
+              passed = t['tests'] - t['failures'] - t['errors'] - t['skipped']
+              print(f"Task {task}: {t['tests']} tests run, {passed} passed, {t['failures']} failed, {t['errors']} errors, {t['skipped']} skipped")
+              for k in total:
+                  total[k] += t[k]
+          tp = total['tests'] - total['failures'] - total['errors'] - total['skipped']
+          print('Skipped tests (one line each, with reason):')
+          for task, cls, name in skipped:
+              print(f"SKIPPED [{task}] {cls} > {name}: {find_reason(cls, name)}")
+          print(f"TOTAL: {total['tests']} tests run, {tp} passed, {total['failures']} failed, {total['errors']} errors, {total['skipped']} skipped")
